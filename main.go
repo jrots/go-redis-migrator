@@ -272,7 +272,8 @@ func migrateKey(key string) {
 	}
 
 	// set ttl to 0 due to restore requiring >= 0 for ttl
-	if ttl == -1 {
+	// since ttl comes as -1000000 instead of -1 check everything less than 0
+	if ttl < 0 {
 		ttl = 0
 	}
 
