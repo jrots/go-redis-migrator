@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/redis.v3" // http://godoc.org/gopkg.in/redis.v3
+	"gopkg.in/redis.v5" // http://godoc.org/gopkg.in/redis.v5
 )
 
 // redis server connections
@@ -194,9 +194,11 @@ func connectSourceCluster() {
 
 	// connect to source cluster and ping it
 	if len(sourceHostsArray) == 1 {
-		sourceHost = redis.NewClient(&redis.Options{
-			Addr: sourceHostsArray[0],
-		})
+		opts, err := redis.ParseURL(sourceHostsArray[0])
+		if err != nil {
+			panic("Error parsing redis url")
+		}
+		sourceHost = redis.NewClient(opts)
 		sourceIsCluster = false
 		//log.Println("Source is a single host.")
 		hostPingTest(sourceHost)
@@ -217,9 +219,11 @@ func connectDestinationCluster() {
 
 	// connect to destination cluster and ping it
 	if len(destinationHostsArray) == 1 {
-		destinationHost = redis.NewClient(&redis.Options{
-			Addr: destinationHostsArray[0],
-		})
+		opts, err := redis.ParseURL(destinationHostsArray[0])
+		if err != nil {
+			panic("Error parsing redis url")
+		}
+		destinationHost = redis.NewClient(opts)
 		destinationIsCluster = false
 		//log.Println("Destination is a single host.")
 		hostPingTest(destinationHost)
