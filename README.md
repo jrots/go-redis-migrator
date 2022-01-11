@@ -1,6 +1,21 @@
-![](https://raw.githubusercontent.com/integrii/go-redis-migrator/master/logo.png)
 
 A cluster aware Redis key migrator.  Moves keys from one cluster or host to another cluster or host.
+
+## this is a hard fork of main lib to make stuff work that I needed  
+
+Could be that all of this gets fixed in main package: github.com/integrii/go-redis-migrator.. 
+pushed it here for reference
+
+```
+./migrator -copyData -sourceHosts=redis://nodex:port\?addr=nodey:port\&addr=nodex:port&addr=.. -destinationHosts=rediss://:pass@nodea:port\?addr=nodeb:port\&addr=nodec:port&addr=..
+```
+- Pipelined restore (batch commands) + use replace (only if key has changed)
+- Use scan operations with checksums instead of slow KEYS* command that was used before. 
+- Add TLS support for f.e. elasticace restores, uses patched version of redis-go adaptor see: https://github.com/go-redis/redis/pull/1924)
+  
+--- 
+
+
 
 
 ## Details
@@ -17,7 +32,6 @@ go-redis-migrator is especially useful for populating test data in development i
  - Finally, run the binary to see the help: `$GOPATH/bin/go-redis-migrator`
 
 ## Example
-
 ```
 ./go-redis-migrator -copyData -sourceHosts=172.31.37.164:6379,172.31.37.162:6379,172.31.37.168:6379,172.31.37.170:6379,172.31.37.169:6379 -destinationHosts=172.31.34.231:6379,172.31.34.228:6379,172.31.34.227:6379,172.31.34.230:6379,172.31.34.229:6379,172.31.34.226:6379 -keyFile=keyList.txt 
 Migrated 57 keys.

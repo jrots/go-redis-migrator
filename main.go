@@ -14,7 +14,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"crypto/sha1"
 
+	"github.com/tidwall/rhh"
 	"github.com/go-redis/redis/v8"
 
 )
@@ -26,9 +28,14 @@ var sourceHost *redis.Client
 var destinationHost *redis.Client
 
 // redis server arrays for connecting
+var sourceHostsString string
 var sourceHostsArray []string
+
 var destinationHostsString string
 var destinationHostsArray []string
+var checkSumMap rhh.Map
+
+var usePipeline = false;
 
 // cluster indication flags
 var sourceIsCluster = false
@@ -40,6 +47,28 @@ var destinationClusterConnected = false
 
 // counter for number of keys migrated
 var keysMigrated int64
+var keysSkipped int64
+
+var keyPipeline redis.Pipeliner = nil
+
+var checkSumScanLua = redis.NewScript(`
+local shas = {};
+local t = {};
+local done = false;
+local cursor = ARGV[1];
+local value = "";
+local val = "";
+local result = redis.call("SCAN", cursor, "count", ARGV[2])
+cursor = result[1];
+t = result[2];
+
+for i=1,#t do
+ local d = t[i];
+ shas[#shas+1] = redis.sha1hex(redis.call('dump', d))
+end;
+ 
+return {cursor, t, shas}
+`)
 
 func main() {
 	ctx := context.Background()
@@ -53,6 +82,8 @@ func main() {
 	var destinationHosts = flag.String("destinationHosts", "", "A list of source cluster host:port servers seperated by spaces. EX) 127.0.0.1:6379,127.0.0.1:6380")
 	var getKeys = flag.Bool("getKeys", false, "Fetches and prints keys from the source host.")
 	var copyData = flag.Bool("copyData", false, "Copies all keys in a specified list to the destination cluster from the source cluster.")
+	usePipeline = *flag.Bool("usePipeline", true, "Speed up process using pipeline.")
+
 	var keyFilePath = flag.String("keyFile", "", "The file path which contains the list of keys to migrate.")
 	var keyFilter = flag.String("keyFilter", "*", "The pattern of keys to migrate if no key file path was specified.")
 
@@ -70,12 +101,12 @@ func main() {
 
 	// connect to the host if servers found
 	// break source hosts comma list into an array
-	var sourceHostsString = *sourceHosts
+	sourceHostsString = *sourceHosts
 	if len(sourceHostsString) > 0 {
 		//log.Println("Source hosts detected: " + sourceHostsString)
 		// break source hosts string at commas into a slice
-		sourceHostsArray = strings.Split(sourceHostsString, ",")
-		connectSourceCluster()
+		sourceHostsArray = strings.Split(sourceHostsString, "&addr")
+		connectSourceCluster(ctx)
 	}
 
 	// connect to the host if servers found
@@ -84,9 +115,11 @@ func main() {
 	if len(destinationHostsString) > 0 {
 		//log.Println("Destination hosts detected: " + destinationHostsString)
 		// break source hosts string at commas into a slice
-		destinationHostsArray = strings.Split(destinationHostsString, ",")
-		connectDestinationCluster()
+		destinationHostsArray = strings.Split(destinationHostsString, "&addr")
+		connectDestinationCluster(ctx)
 	}
+
+	loadDestinationChecksum(ctx);
 
 	//
 	// Do the right thing depending on the operations passed from cli
@@ -103,7 +136,7 @@ func main() {
 		//log.Println("Getting full key list...")
 		// iterate through each host in the destination cluster, connect, and
 		// run KEYS search
-		var allKeys = getSourceKeys(*keyFilter)
+		var allKeys = getSourceKeys(ctx, *keyFilter)
 
 		// see how many keys we fetched
 		if len(allKeys) > 0 {
@@ -152,46 +185,61 @@ func main() {
 				var key = keyFileScanner.Text()
 
 				// migrate the key from source to destination
-				migrateKey(ctx, key)
+				fmt.Println(checkSumMap.Get(shasum(key)))
+				//migrateKey(ctx, key)
 
 			}
 		} else {
-			// This is what we do if no key file was specified
+			if sourceIsCluster {
+				sourceCluster.ForEachMaster(ctx, func(ctx context.Context, rdb *redis.Client) error {
+					var err error
+					cursor := "0"
+					for {
+						keys := []string{}
+						values := []interface{}{cursor, 10000}
+						res, _ := checkSumScanLua.Run(ctx, rdb, keys, values...).Result()
+						if x, ok := res.([]interface{}); ok {
+							cursor = fmt.Sprintf("%v", x[0])
+							if y, ok := x[1].([]interface{}); ok {
+								if z, ok := x[2].([]interface{}); ok {
+									for index, val := range y {
+										foundKey := fmt.Sprintf("%v", val)
+										checkSumVal, found := checkSumMap.Get(shasum(foundKey))
+										if found == false || fmt.Sprintf("%v", checkSumVal) !=  fmt.Sprintf("%v",z[index]) {
+											migrateKey(ctx, foundKey)
+										} else {
+											keysSkipped = keysSkipped + 1
+										}
+									}
+								}
+							}
+						} else {
+							break;
+						}
 
-			var cursor uint64
-			for {
-				var keys []string
-				var err error
-
-				if sourceIsCluster == true {
-					keys, cursor, err = sourceCluster.Scan(ctx,cursor, *keyFilter, 0).Result()
-				} else {
-					keys, cursor, err = sourceHost.Scan(ctx,cursor, *keyFilter, 0).Result()
+						if cursor == "0" { // no more keys
+							break
+						}
+					}
+					return err
+				})
+				if usePipeline && keyPipeline != nil && keyPipeline.Len() > 0 {
+					keyPipeline.Exec(ctx)
 				}
 
-				if err != nil {
-					panic(err)
-				}
-
-				for _, key := range keys {
-					migrateKey(ctx, key)
-				}
-
-				if cursor == 0 { // no more keys
-					break
-				}
+			} else {
+				panic("implement")
 			}
 		}
 
 	}
 
 	// Finish up with some stats
-	fmt.Println("Migrated " + strconv.FormatInt(keysMigrated, 10) + " keys.")
+	log.Println("Migrated " + strconv.FormatInt(keysMigrated, 10) + " keys, Skipped "+ strconv.FormatInt(keysSkipped, 10))
 }
 
 // ping testing functions
-func clusterPingTest(redisClient *redis.ClusterClient) {
-	ctx := context.Background()
+func clusterPingTest(ctx context.Context, redisClient *redis.ClusterClient) {
 	var pingTest = redisClient.Ping(ctx)
 	var pingMessage, pingError = pingTest.Result()
 	if pingError != nil {
@@ -199,8 +247,7 @@ func clusterPingTest(redisClient *redis.ClusterClient) {
 		log.Fatalln("Error when pinging a Redis connection:" + pingMessage)
 	}
 }
-func hostPingTest(redisClient *redis.Client) {
-	ctx := context.Background()
+func hostPingTest(ctx context.Context, redisClient *redis.Client) {
 	var pingTest = redisClient.Ping(ctx)
 	var pingMessage, pingError = pingTest.Result()
 	if pingError != nil {
@@ -210,7 +257,7 @@ func hostPingTest(redisClient *redis.Client) {
 }
 
 // Connects to the source host/cluster
-func connectSourceCluster() {
+func connectSourceCluster(ctx context.Context) {
 
 	// connect to source cluster and ping it
 	if len(sourceHostsArray) == 1 {
@@ -221,24 +268,32 @@ func connectSourceCluster() {
 		sourceHost = redis.NewClient(opts)
 		sourceIsCluster = false
 		//log.Println("Source is a single host.")
-		hostPingTest(sourceHost)
+		hostPingTest(ctx, sourceHost)
 	} else {
-		sourceCluster = redis.NewClusterClient(&redis.ClusterOptions{
-			Addrs: sourceHostsArray,
-		})
+		opts, err := redis.ParseClusterURL(sourceHostsString)
+		if err != nil {
+			panic("Error parsing redis url")
+		}
+		sourceCluster = redis.NewClusterClient(opts)
 		sourceIsCluster = true
-		//log.Println("Source is a cluster.")
-		clusterPingTest(sourceCluster)
+
+		clusterPingTest(ctx, sourceCluster)
 	}
 	sourceClusterConnected = true
-	//log.Println("Source connected")
+}
+
+func shasum(fn string) string {
+	h := sha1.New()
+	h.Write([]byte(fn))
+	bs := h.Sum(nil)
+	return fmt.Sprintf("%x", bs)
 }
 
 // Connects to the destination host/cluster
-func connectDestinationCluster() {
+func connectDestinationCluster(ctx context.Context) {
 
 	// connect to destination cluster and ping it
-	if false && len(destinationHostsArray) == 1 {
+	if len(destinationHostsArray) == 1 {
 		opts, err := redis.ParseURL(destinationHostsArray[0])
 		if err != nil {
 			panic("Error parsing redis url")
@@ -246,28 +301,59 @@ func connectDestinationCluster() {
 		destinationHost = redis.NewClient(opts)
 		destinationIsCluster = false
 		//log.Println("Destination is a single host.")
-		hostPingTest(destinationHost)
+		hostPingTest(ctx, destinationHost)
 	} else {
 
 		opts, err := redis.ParseClusterURL(destinationHostsString)
-		//fmt.Println(opts)
-		fmt.Printf("%+v\n", opts)
 		if err != nil {
 			panic("Error parsing redis url")
 		}
-
 		destinationCluster = redis.NewClusterClient(opts)
 		destinationIsCluster = true
 		//log.Println("Destination is a cluster.")
-		clusterPingTest(destinationCluster)
+		clusterPingTest(ctx, destinationCluster)
 	}
 	destinationClusterConnected = true
 	//log.Println("Destination connected.")
 }
 
+func loadDestinationChecksum(ctx context.Context) {
+
+	if destinationIsCluster {
+		destinationCluster.ForEachMaster(ctx, func(ctx context.Context, rdb *redis.Client) error {
+			var err error
+			cursor := "0"
+			for {
+				keys := []string{}
+				values := []interface{}{cursor, 10000}
+				res, _ := checkSumScanLua.Run(ctx, rdb, keys, values...).Result()
+				if x, ok := res.([]interface{}); ok {
+					cursor = fmt.Sprintf("%v", x[0])
+					if y, ok := x[1].([]interface{}); ok {
+						if z, ok := x[2].([]interface{}); ok {
+							for index, val := range y {
+								checkSumMap.Set(shasum(fmt.Sprintf("%v", val)), z[index])
+							}
+						}
+					}
+				} else {
+					break
+				}
+				log.Println("Loaded: " + strconv.Itoa(checkSumMap.Len())  + " destination checksum keys cursor:" + cursor)
+
+				if cursor == "0" { // no more keys
+					break
+				}
+			}
+			return err
+		})
+	} else {
+		panic("implement")
+	}
+}
+
 // Gets all the keys from the source server/cluster
-func getSourceKeys(keyFilter string) []string {
-	ctx := context.Background()
+func getSourceKeys(ctx context.Context, keyFilter string) []string {
 	var allKeys *redis.StringSliceCmd
 	if sourceIsCluster == true {
 		allKeys = sourceCluster.Keys(ctx, keyFilter)
@@ -280,8 +366,6 @@ func getSourceKeys(keyFilter string) []string {
 
 // Migrates a key from the source cluster to the deestination one
 func migrateKey(ctx context.Context, key string) {
-
-	log.Println("migrating key:" + key)
 
 	keysMigrated = keysMigrated + 1
 
@@ -309,9 +393,25 @@ func migrateKey(ctx context.Context, key string) {
 
 	// put the key in the destination cluster and set the ttl
 	if destinationIsCluster == true {
-		destinationCluster.Restore(ctx, key, ttl, data)
+		if usePipeline {
+			if keyPipeline == nil {
+				keyPipeline = destinationCluster.Pipeline()
+			} else if keyPipeline.Len() > 1000  {
+				_, err := keyPipeline.Exec(ctx)
+				if err != nil {
+					fmt.Println(err)
+				}
+				log.Println("Migrated " + strconv.FormatInt(keysMigrated, 10) + " keys, Skipped "+ strconv.FormatInt(keysSkipped, 10))
+				keyPipeline = destinationCluster.Pipeline()
+			}
+			keyPipeline.RestoreReplace(ctx, key, ttl, data)
+		} else {
+			destinationCluster.RestoreReplace(ctx, key, ttl, data)
+		}
+
 	} else {
-		destinationHost.Restore(ctx, key, ttl, data)
+		destinationHost.RestoreReplace(ctx, key, ttl, data)
+
 	}
 
 	return
