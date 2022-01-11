@@ -2,8 +2,6 @@ module github.com/integrii/go-redis-migrator
 
 go 1.16
 
-require (
-	github.com/onsi/ginkgo v1.16.4 // indirect
-	github.com/onsi/gomega v1.13.0 // indirect
-	gopkg.in/redis.v5 v5.2.9
-)
+require github.com/go-redis/redis/v8 v8.0.0-00010101000000-000000000000
+
+replace github.com/go-redis/redis/v8 => ../redis-1

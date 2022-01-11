@@ -6,6 +6,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -14,7 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/redis.v5" // http://godoc.org/gopkg.in/redis.v5
+	"github.com/go-redis/redis/v8"
+
 )
 
 // redis server connections
@@ -25,6 +27,7 @@ var destinationHost *redis.Client
 
 // redis server arrays for connecting
 var sourceHostsArray []string
+var destinationHostsString string
 var destinationHostsArray []string
 
 // cluster indication flags
@@ -39,6 +42,7 @@ var destinationClusterConnected = false
 var keysMigrated int64
 
 func main() {
+	ctx := context.Background()
 
 	//
 	// Command line argument handling
@@ -76,7 +80,7 @@ func main() {
 
 	// connect to the host if servers found
 	// break destination hosts comma list into an array
-	var destinationHostsString = *destinationHosts
+	destinationHostsString = *destinationHosts
 	if len(destinationHostsString) > 0 {
 		//log.Println("Destination hosts detected: " + destinationHostsString)
 		// break source hosts string at commas into a slice
@@ -148,22 +152,34 @@ func main() {
 				var key = keyFileScanner.Text()
 
 				// migrate the key from source to destination
-				migrateKey(key)
+				migrateKey(ctx, key)
 
 			}
 		} else {
 			// This is what we do if no key file was specified
 
-			var allKeys = getSourceKeys(*keyFilter)
+			var cursor uint64
+			for {
+				var keys []string
+				var err error
 
-			if len(allKeys) > 0 {
-				// loop through all keys and print them plainly one per line
-				for i := 0; i < len(allKeys); i++ {
-					var key = allKeys[i]
-					migrateKey(key)
+				if sourceIsCluster == true {
+					keys, cursor, err = sourceCluster.Scan(ctx,cursor, *keyFilter, 0).Result()
+				} else {
+					keys, cursor, err = sourceHost.Scan(ctx,cursor, *keyFilter, 0).Result()
 				}
-			} else {
-				fmt.Println("No keys found in source cluster.")
+
+				if err != nil {
+					panic(err)
+				}
+
+				for _, key := range keys {
+					migrateKey(ctx, key)
+				}
+
+				if cursor == 0 { // no more keys
+					break
+				}
 			}
 		}
 
@@ -175,16 +191,20 @@ func main() {
 
 // ping testing functions
 func clusterPingTest(redisClient *redis.ClusterClient) {
-	var pingTest = redisClient.Ping()
+	ctx := context.Background()
+	var pingTest = redisClient.Ping(ctx)
 	var pingMessage, pingError = pingTest.Result()
 	if pingError != nil {
+		fmt.Println(pingError)
 		log.Fatalln("Error when pinging a Redis connection:" + pingMessage)
 	}
 }
 func hostPingTest(redisClient *redis.Client) {
-	var pingTest = redisClient.Ping()
+	ctx := context.Background()
+	var pingTest = redisClient.Ping(ctx)
 	var pingMessage, pingError = pingTest.Result()
 	if pingError != nil {
+		//fmt.Println(pingError)
 		log.Fatalln("Error when pinging a Redis connection:" + pingMessage)
 	}
 }
@@ -218,7 +238,7 @@ func connectSourceCluster() {
 func connectDestinationCluster() {
 
 	// connect to destination cluster and ping it
-	if len(destinationHostsArray) == 1 {
+	if false && len(destinationHostsArray) == 1 {
 		opts, err := redis.ParseURL(destinationHostsArray[0])
 		if err != nil {
 			panic("Error parsing redis url")
@@ -228,9 +248,15 @@ func connectDestinationCluster() {
 		//log.Println("Destination is a single host.")
 		hostPingTest(destinationHost)
 	} else {
-		destinationCluster = redis.NewClusterClient(&redis.ClusterOptions{
-			Addrs: destinationHostsArray,
-		})
+
+		opts, err := redis.ParseClusterURL(destinationHostsString)
+		//fmt.Println(opts)
+		fmt.Printf("%+v\n", opts)
+		if err != nil {
+			panic("Error parsing redis url")
+		}
+
+		destinationCluster = redis.NewClusterClient(opts)
 		destinationIsCluster = true
 		//log.Println("Destination is a cluster.")
 		clusterPingTest(destinationCluster)
@@ -241,21 +267,21 @@ func connectDestinationCluster() {
 
 // Gets all the keys from the source server/cluster
 func getSourceKeys(keyFilter string) []string {
-
+	ctx := context.Background()
 	var allKeys *redis.StringSliceCmd
 	if sourceIsCluster == true {
-		allKeys = sourceCluster.Keys(keyFilter)
+		allKeys = sourceCluster.Keys(ctx, keyFilter)
 	} else {
-		allKeys = sourceHost.Keys(keyFilter)
+		allKeys = sourceHost.Keys(ctx, keyFilter)
 	}
 
 	return allKeys.Val()
 }
 
 // Migrates a key from the source cluster to the deestination one
-func migrateKey(key string) {
+func migrateKey(ctx context.Context, key string) {
 
-	//log.Println("migrating key:" + key)
+	log.Println("migrating key:" + key)
 
 	keysMigrated = keysMigrated + 1
 
@@ -267,12 +293,12 @@ func migrateKey(key string) {
 
 	// get the key from the source
 	if sourceIsCluster == true {
-		data = sourceCluster.Dump(key).Val()
-		ttl = sourceCluster.PTTL(key).Val()
+		data = sourceCluster.Dump(ctx, key).Val()
+		ttl = sourceCluster.PTTL(ctx, key).Val()
 
 	} else {
-		data = sourceHost.Dump(key).Val()
-		ttl = sourceHost.PTTL(key).Val()
+		data = sourceHost.Dump(ctx, key).Val()
+		ttl = sourceHost.PTTL(ctx, key).Val()
 	}
 
 	// set ttl to 0 due to restore requiring >= 0 for ttl
@@ -283,9 +309,9 @@ func migrateKey(key string) {
 
 	// put the key in the destination cluster and set the ttl
 	if destinationIsCluster == true {
-		destinationCluster.Restore(key, ttl, data)
+		destinationCluster.Restore(ctx, key, ttl, data)
 	} else {
-		destinationHost.Restore(key, ttl, data)
+		destinationHost.Restore(ctx, key, ttl, data)
 	}
 
 	return
